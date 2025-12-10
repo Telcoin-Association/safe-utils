@@ -615,35 +615,65 @@ library Safe {
         string memory derivationPath
     ) internal returns (bytes memory) {
         if (bytes(derivationPath).length > 0) {
-            string[] memory inputs = new string[](8);
-            inputs[0] = "cast";
-            inputs[1] = "wallet";
-            inputs[2] = "sign";
-            inputs[3] = string.concat(
-                "--",
-                vm.envOr("HARDWARE_WALLET", string("ledger"))
+            string memory hardwareWallet = vm.envOr(
+                "HARDWARE_WALLET",
+                string("ledger")
             );
-            inputs[4] = "--mnemonic-derivation-path";
-            inputs[5] = derivationPath;
-            inputs[6] = "--data";
-            inputs[7] = string.concat(
-                '{"domain":{"chainId":"',
-                vm.toString(block.chainid),
-                '","verifyingContract":"',
-                vm.toString(instance(self).safe),
-                '"},"message":{"to":"',
-                vm.toString(to),
-                '","value":"0","data":"',
-                vm.toString(data),
-                '","operation":',
-                vm.toString(uint8(operation)),
-                ',"baseGas":"0","gasPrice":"0","gasToken":"0x0000000000000000000000000000000000000000","refundReceiver":"0x0000000000000000000000000000000000000000","nonce":',
-                vm.toString(nonce),
-                ',"safeTxGas":"0"},"primaryType":"SafeTx","types":{"SafeTx":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"},{"name":"operation","type":"uint8"},{"name":"safeTxGas","type":"uint256"},{"name":"baseGas","type":"uint256"},{"name":"gasPrice","type":"uint256"},{"name":"gasToken","type":"address"},{"name":"refundReceiver","type":"address"},{"name":"nonce","type":"uint256"}]}}'
-            );
-            /// forge-lint: disable-next-line(unsafe-cheatcode)
-            bytes memory output = vm.ffi(inputs);
-            return output;
+
+            // Trezor: sign raw hash (cast doesn't support EIP-712 --data for Trezor)
+            if (
+                keccak256(bytes(hardwareWallet)) == keccak256(bytes("trezor"))
+            ) {
+                bytes32 safeTxHash = getSafeTxHash(
+                    self,
+                    to,
+                    0,
+                    data,
+                    operation,
+                    nonce
+                );
+
+                string[] memory inputs = new string[](7);
+                inputs[0] = "cast";
+                inputs[1] = "wallet";
+                inputs[2] = "sign";
+                inputs[3] = "--trezor";
+                inputs[4] = "--mnemonic-derivation-path";
+                inputs[5] = derivationPath;
+                inputs[6] = vm.toString(safeTxHash);
+
+                bytes memory output = vm.ffi(inputs);
+                return output;
+            }
+            // Ledger: use EIP-712 typed data signing (fully supported)
+            else {
+                string[] memory inputs = new string[](8);
+                inputs[0] = "cast";
+                inputs[1] = "wallet";
+                inputs[2] = "sign";
+                inputs[3] = "--ledger";
+                inputs[4] = "--mnemonic-derivation-path";
+                inputs[5] = derivationPath;
+                inputs[6] = "--data";
+                inputs[7] = string.concat(
+                    '{"domain":{"chainId":"',
+                    vm.toString(block.chainid),
+                    '","verifyingContract":"',
+                    vm.toString(instance(self).safe),
+                    '"},"message":{"to":"',
+                    vm.toString(to),
+                    '","value":"0","data":"',
+                    vm.toString(data),
+                    '","operation":',
+                    vm.toString(uint8(operation)),
+                    ',"baseGas":"0","gasPrice":"0","gasToken":"0x0000000000000000000000000000000000000000","refundReceiver":"0x0000000000000000000000000000000000000000","nonce":',
+                    vm.toString(nonce),
+                    ',"safeTxGas":"0"},"primaryType":"SafeTx","types":{"SafeTx":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"},{"name":"operation","type":"uint8"},{"name":"safeTxGas","type":"uint256"},{"name":"baseGas","type":"uint256"},{"name":"gasPrice","type":"uint256"},{"name":"gasToken","type":"address"},{"name":"refundReceiver","type":"address"},{"name":"nonce","type":"uint256"}]}}'
+                );
+
+                bytes memory output = vm.ffi(inputs);
+                return output;
+            }
         } else {
             Signature memory sig;
             (sig.v, sig.r, sig.s) = vm.sign(
