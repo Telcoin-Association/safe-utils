@@ -70,6 +70,8 @@ ffi = true
 ```
 
 - All `Recon-Fuzz/solidity-http` dependencies
+- set .env `HARDWARE_WALLET=trezor/ledger/etc.`
+  - default is `ledger`
 
 ### Demo
 
