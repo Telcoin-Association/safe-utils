@@ -649,6 +649,10 @@ library Safe {
                 inputs[6] = vm.toString(safeTxHash);
 
                 bytes memory output = vm.ffi(inputs);
+                // Trezor uses eth_sign which adds prefix - Safe needs v+4 to know this
+                // Signature format: r (32 bytes) || s (32 bytes) || v (1 byte)
+                uint8 v = uint8(output[64]);
+                output[64] = bytes1(v + 4);
                 return output;
             }
             // Ledger: use EIP-712 typed data signing (fully supported)
