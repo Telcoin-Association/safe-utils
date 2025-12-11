@@ -361,13 +361,15 @@ library Safe {
     /// @param  data        The data payload for the transaction
     /// @param  sender      The address of the account that is proposing the transaction
     /// @param  signature   The precomputed signature for the transaction, e.g. using {sign}
+    /// @param  nonce       The nonce to use.
     /// @return txHash      The hash of the proposed Safe transaction
     function proposeTransactionWithSignature(
         Client storage self,
         address to,
         bytes memory data,
         address sender,
-        bytes memory signature
+        bytes memory signature,
+        uint256 nonce
     ) internal returns (bytes32 txHash) {
         ExecTransactionParams memory params = ExecTransactionParams({
             to: to,
@@ -376,7 +378,7 @@ library Safe {
             operation: Enum.Operation.Call,
             sender: sender,
             signature: signature,
-            nonce: getNonce(self)
+            nonce: nonce
         });
         txHash = proposeTransaction(self, params);
         return txHash;
