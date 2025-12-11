@@ -6,6 +6,7 @@ import {HTTP} from "solidity-http/HTTP.sol";
 import {MultiSendCallOnly} from "safe-smart-account/libraries/MultiSendCallOnly.sol";
 import {Enum} from "safe-smart-account/common/Enum.sol";
 import {ISafeSmartAccount} from "./ISafeSmartAccount.sol";
+import {console} from "forge-std/console.sol";
 
 library Safe {
     using HTTP for *;
@@ -631,6 +632,11 @@ library Safe {
                     data,
                     operation,
                     nonce
+                );
+
+                console.log(
+                    "proposing signature for tx hash:",
+                    vm.toString(safeTxHash)
                 );
 
                 string[] memory inputs = new string[](7);
