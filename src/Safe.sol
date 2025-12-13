@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import {Vm} from "forge-std/Vm.sol";
+import {Vm, VmSafe} from "forge-std/Vm.sol";
 import {HTTP} from "solidity-http/HTTP.sol";
 import {MultiSendCallOnly} from "safe-smart-account/libraries/MultiSendCallOnly.sol";
 import {Enum} from "safe-smart-account/common/Enum.sol";
@@ -15,7 +15,7 @@ library Safe {
     Vm constant vm =
         Vm(address(bytes20(uint160(uint256(keccak256("hevm cheat code"))))));
 
-    // https://github.com/safe-global/safe-smart-account/blob/release/v1.4.1/contracts/libraries/SafeStorage.sol
+    // https://github.com/safe-global/safe-smart-account/blob/release/v1.4.1/contracts/SafeStorage.sol
     bytes32 constant SAFE_THRESHOLD_STORAGE_SLOT = bytes32(uint256(4));
 
     // https://github.com/safe-global/safe-deployments/blob/v1.37.32/src/assets/v1.3.0/multi_send_call_only.json
@@ -30,6 +30,8 @@ library Safe {
     error MultiSendCallOnlyNotFound(uint256 chainId);
     error ArrayLengthsMismatch(uint256 a, uint256 b);
     error ProposeTransactionFailed(uint256 statusCode, string response);
+    error SimulationFailed(string reason);
+    error ExecTransactionFailed(bytes returnData);
 
     struct Instance {
         address safe;
@@ -58,6 +60,34 @@ library Safe {
         bytes signature;
         uint256 nonce;
     }
+
+    // ============================================================
+    //                     BROADCAST MODE DETECTION
+    // ============================================================
+
+    /// @notice Check if we're in broadcast mode (--broadcast flag passed)
+    /// @dev Uses Foundry's context detection
+    function isBroadcastMode() internal view returns (bool) {
+        // Try to detect broadcast context
+        // In Foundry, ScriptBroadcast context is set when --broadcast is passed
+        try vm.isContext(VmSafe.ForgeContext.ScriptBroadcast) returns (
+            bool isBroadcast
+        ) {
+            return isBroadcast;
+        } catch {
+            // Fallback: check environment variable
+            return vm.envOr("SAFE_BROADCAST", false);
+        }
+    }
+
+    /// @notice Check if we're in simulation mode (no --broadcast flag)
+    function isSimulationMode() internal view returns (bool) {
+        return !isBroadcastMode();
+    }
+
+    // ============================================================
+    //                      INITIALIZATION
+    // ============================================================
 
     function initialize(
         Client storage self,
@@ -210,6 +240,299 @@ library Safe {
                 nonce
             );
     }
+
+    // ============================================================
+    //                    SIMULATION FUNCTIONS
+    // ============================================================
+
+    /// @notice Simulate a Safe transaction on the current fork
+    /// @dev Uses vm.prank to execute as a Safe owner. For single-signer Safes.
+    /// @param self The Safe client
+    /// @param params The transaction parameters
+    /// @return success Whether the simulation succeeded
+    function simulateTransaction(
+        Client storage self,
+        ExecTransactionParams memory params
+    ) internal returns (bool success) {
+        address safeAddress = instance(self).safe;
+
+        console.log("\n[SIMULATION] Simulating Safe transaction...");
+        console.log("  Safe:", safeAddress);
+        console.log("  To:", params.to);
+        console.log("  Value:", params.value);
+        console.log("  Operation:", uint8(params.operation));
+        console.log("  Nonce:", params.nonce);
+
+        // Build the execTransaction calldata
+        bytes memory execData = abi.encodeCall(
+            ISafeSmartAccount.execTransaction,
+            (
+                params.to,
+                params.value,
+                params.data,
+                params.operation,
+                0, // safeTxGas
+                0, // baseGas
+                0, // gasPrice
+                address(0), // gasToken
+                payable(0), // refundReceiver
+                params.signature
+            )
+        );
+
+        // Prank as the sender (Safe owner) and call the Safe
+        vm.prank(params.sender);
+        (success, ) = safeAddress.call(execData);
+
+        if (success) {
+            console.log(
+                "[SIMULATION] SUCCESS - Transaction would execute correctly"
+            );
+        } else {
+            console.log("[SIMULATION] FAILED - Transaction would revert");
+        }
+
+        return success;
+    }
+
+    /// @notice Simulate a single transaction
+    /// @dev Convenience wrapper that builds params and simulates
+    function simulateTransaction(
+        Client storage self,
+        address to,
+        bytes memory data,
+        address sender,
+        string memory derivationPath
+    ) internal returns (bool success) {
+        uint256 nonce = getNonce(self);
+        bytes memory signature = sign(
+            self,
+            to,
+            data,
+            Enum.Operation.Call,
+            sender,
+            nonce,
+            derivationPath
+        );
+
+        ExecTransactionParams memory params = ExecTransactionParams({
+            to: to,
+            value: 0,
+            data: data,
+            operation: Enum.Operation.Call,
+            sender: sender,
+            signature: signature,
+            nonce: nonce
+        });
+
+        return simulateTransaction(self, params);
+    }
+
+    /// @notice Simulate multiple transactions via MultiSend
+    function simulateTransactions(
+        Client storage self,
+        address[] memory targets,
+        bytes[] memory datas,
+        address sender,
+        string memory derivationPath
+    ) internal returns (bool success) {
+        (address to, bytes memory data) = getProposeTransactionsTargetAndData(
+            self,
+            targets,
+            datas
+        );
+
+        uint256 nonce = getNonce(self);
+        bytes memory signature = sign(
+            self,
+            to,
+            data,
+            Enum.Operation.DelegateCall,
+            sender,
+            nonce,
+            derivationPath
+        );
+
+        ExecTransactionParams memory params = ExecTransactionParams({
+            to: to,
+            value: 0,
+            data: data,
+            operation: Enum.Operation.DelegateCall,
+            sender: sender,
+            signature: signature,
+            nonce: nonce
+        });
+
+        return simulateTransaction(self, params);
+    }
+
+    /// @notice Simulate without requiring hardware wallet signature
+    /// @dev Creates an "approved hash" style signature for simulation only
+    ///      This works because we prank as an owner
+    function simulateTransactionNoSign(
+        Client storage self,
+        address to,
+        bytes memory data,
+        address sender
+    ) internal returns (bool success) {
+        uint256 nonce = getNonce(self);
+
+        // For simulation, we can use a pre-approved hash signature format
+        // The Safe accepts signatures where v=1 means "approved hash"
+        // But simpler: we just vm.prank as owner and the Safe will accept
+        // We'll create a dummy signature that will work with prank
+
+        // Actually, the cleanest approach is to temporarily set threshold to 0
+        // or use vm.store to mark the hash as approved
+
+        address safeAddress = instance(self).safe;
+        bytes32 txHash = getSafeTxHash(
+            self,
+            to,
+            0,
+            data,
+            Enum.Operation.Call,
+            nonce
+        );
+
+        // Store the hash as approved (approvedHashes[owner][hash] = 1)
+        // Slot: keccak256(abi.encode(hash, keccak256(abi.encode(owner, 8))))
+        // Safe's approvedHashes is at slot 8
+        bytes32 ownerSlot = keccak256(abi.encode(sender, uint256(8)));
+        bytes32 approvalSlot = keccak256(abi.encode(txHash, ownerSlot));
+        vm.store(safeAddress, approvalSlot, bytes32(uint256(1)));
+
+        // Create approved hash signature (r=owner, s=0, v=1)
+        bytes memory signature = abi.encodePacked(
+            bytes32(uint256(uint160(sender))), // r = owner address padded
+            bytes32(0), // s = 0
+            uint8(1) // v = 1 means approved hash
+        );
+
+        ExecTransactionParams memory params = ExecTransactionParams({
+            to: to,
+            value: 0,
+            data: data,
+            operation: Enum.Operation.Call,
+            sender: sender,
+            signature: signature,
+            nonce: nonce
+        });
+
+        return simulateTransaction(self, params);
+    }
+
+    /// @notice Simulate multiple transactions without hardware wallet signature
+    function simulateTransactionsNoSign(
+        Client storage self,
+        address[] memory targets,
+        bytes[] memory datas,
+        address sender
+    ) internal returns (bool success) {
+        (address to, bytes memory data) = getProposeTransactionsTargetAndData(
+            self,
+            targets,
+            datas
+        );
+
+        uint256 nonce = getNonce(self);
+        address safeAddress = instance(self).safe;
+        bytes32 txHash = getSafeTxHash(
+            self,
+            to,
+            0,
+            data,
+            Enum.Operation.DelegateCall,
+            nonce
+        );
+
+        // Store the hash as approved
+        bytes32 ownerSlot = keccak256(abi.encode(sender, uint256(8)));
+        bytes32 approvalSlot = keccak256(abi.encode(txHash, ownerSlot));
+        vm.store(safeAddress, approvalSlot, bytes32(uint256(1)));
+
+        // Create approved hash signature
+        bytes memory signature = abi.encodePacked(
+            bytes32(uint256(uint160(sender))),
+            bytes32(0),
+            uint8(1)
+        );
+
+        ExecTransactionParams memory params = ExecTransactionParams({
+            to: to,
+            value: 0,
+            data: data,
+            operation: Enum.Operation.DelegateCall,
+            sender: sender,
+            signature: signature,
+            nonce: nonce
+        });
+
+        return simulateTransaction(self, params);
+    }
+
+    // ============================================================
+    //          UNIFIED EXECUTE/PROPOSE (AUTO-DETECTS MODE)
+    // ============================================================
+
+    /// @notice Execute or propose a transaction based on broadcast mode
+    /// @dev In simulation mode: executes on fork. In broadcast mode: proposes to Safe API.
+    /// @param self The Safe client
+    /// @param to Target address
+    /// @param data Calldata
+    /// @param sender Signer address
+    /// @param derivationPath HW wallet derivation path (empty for simulation)
+    /// @return result In broadcast mode: safeTxHash. In simulation: success as bytes32.
+    function executeOrPropose(
+        Client storage self,
+        address to,
+        bytes memory data,
+        address sender,
+        string memory derivationPath
+    ) internal returns (bytes32 result) {
+        if (isBroadcastMode()) {
+            console.log("\n[BROADCAST MODE] Proposing to Safe API...");
+            return proposeTransaction(self, to, data, sender, derivationPath);
+        } else {
+            console.log("\n[SIMULATION MODE] Executing on fork...");
+            bool success = simulateTransactionNoSign(self, to, data, sender);
+            return success ? bytes32(uint256(1)) : bytes32(0);
+        }
+    }
+
+    /// @notice Execute or propose multiple transactions based on broadcast mode
+    function executeOrProposeMulti(
+        Client storage self,
+        address[] memory targets,
+        bytes[] memory datas,
+        address sender,
+        string memory derivationPath
+    ) internal returns (bytes32 result) {
+        if (isBroadcastMode()) {
+            console.log("\n[BROADCAST MODE] Proposing batch to Safe API...");
+            return
+                proposeTransactions(
+                    self,
+                    targets,
+                    datas,
+                    sender,
+                    derivationPath
+                );
+        } else {
+            console.log("\n[SIMULATION MODE] Executing batch on fork...");
+            bool success = simulateTransactionsNoSign(
+                self,
+                targets,
+                datas,
+                sender
+            );
+            return success ? bytes32(uint256(1)) : bytes32(0);
+        }
+    }
+
+    // ============================================================
+    //                    PROPOSE FUNCTIONS (ORIGINAL)
+    // ============================================================
 
     // https://github.com/safe-global/safe-core-sdk/blob/r60/packages/api-kit/src/SafeApiKit.ts#L574
     function proposeTransaction(
@@ -483,6 +806,10 @@ library Safe {
         return txHash;
     }
 
+    // ============================================================
+    //                 EXEC TRANSACTION DATA BUILDERS
+    // ============================================================
+
     function getExecTransactionData(
         Client storage self,
         address to,
@@ -597,6 +924,10 @@ library Safe {
                 )
             );
     }
+
+    // ============================================================
+    //                      SIGNING FUNCTIONS
+    // ============================================================
 
     /// @notice Prepare the signature for a transaction, using a custom nonce
     ///
