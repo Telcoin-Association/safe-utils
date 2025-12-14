@@ -441,7 +441,7 @@ library Safe {
     function _verifyDeploymentIfApplicable(
         address target,
         bytes memory data
-    ) internal view {
+    ) internal pure {
         // Check if this is a CreateX call
         if (target != 0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed) {
             return; // Not CreateX
