@@ -4,6 +4,7 @@ pragma solidity ^0.8.13;
 import {Script} from "forge-std/Script.sol";
 import {console} from "forge-std/console.sol";
 import {Safe} from "./Safe.sol";
+import {Enum} from "safe-smart-account/common/Enum.sol";
 
 /**
  * @title SafeScriptBase
@@ -163,12 +164,23 @@ abstract contract SafeScriptBase is Script {
             // Note: In simulation, the Safe's nonce increases after execTransaction
             currentNonce++;
         } else {
-            // Broadcast mode: propose to Safe API
-            result = safe.proposeTransaction(
+            // Broadcast mode: propose to Safe API with explicit nonce
+            // (on-chain nonce doesn't increment until tx is executed)
+            bytes memory signature = safe.sign(
+                target,
+                data,
+                Enum.Operation.Call,
+                signer,
+                currentNonce,
+                derivationPath
+            );
+
+            result = safe.proposeTransactionWithSignature(
                 target,
                 data,
                 signer,
-                derivationPath
+                signature,
+                currentNonce
             );
 
             console.log("  [PROPOSED] SafeTxHash:", vm.toString(result));
@@ -262,11 +274,24 @@ abstract contract SafeScriptBase is Script {
             result = bytes32(uint256(1));
             currentNonce++;
         } else {
-            result = safe.proposeTransactions(
+            (address to, bytes memory data) = safe
+                .getProposeTransactionsTargetAndData(targets, datas);
+
+            bytes memory signature = safe.sign(
+                to,
+                data,
+                Enum.Operation.DelegateCall,
+                signer,
+                currentNonce,
+                derivationPath
+            );
+
+            result = safe.proposeTransactionsWithSignature(
                 targets,
                 datas,
                 signer,
-                derivationPath
+                signature,
+                currentNonce
             );
 
             console.log("  [PROPOSED] SafeTxHash:", vm.toString(result));

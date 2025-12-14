@@ -979,6 +979,33 @@ library Safe {
         return txHash;
     }
 
+    /// @notice Propose multiple transactions with a precomputed signature and explicit nonce
+    function proposeTransactionsWithSignature(
+        Client storage self,
+        address[] memory targets,
+        bytes[] memory datas,
+        address sender,
+        bytes memory signature,
+        uint256 nonce
+    ) internal returns (bytes32 txHash) {
+        (address to, bytes memory data) = getProposeTransactionsTargetAndData(
+            self,
+            targets,
+            datas
+        );
+        ExecTransactionParams memory params = ExecTransactionParams({
+            to: to,
+            value: 0,
+            data: data,
+            operation: Enum.Operation.DelegateCall,
+            sender: sender,
+            signature: signature,
+            nonce: nonce
+        });
+        txHash = proposeTransaction(self, params);
+        return txHash;
+    }
+
     // ============================================================
     //                 EXEC TRANSACTION DATA BUILDERS
     // ============================================================
