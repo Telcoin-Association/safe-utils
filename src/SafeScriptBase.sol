@@ -144,7 +144,16 @@ abstract contract SafeScriptBase is Script {
 
             if (!success) {
                 console.log("  [SIMULATION FAILED] Transaction would revert!");
-                revert("Simulation failed");
+                console.log("");
+                console.log("  DEBUGGING TIPS:");
+                console.log(
+                    "  1. Run with SAFE_DEBUG=true to bypass Safe and see inner revert"
+                );
+                console.log("  2. Check -vvvvv output for full stack trace");
+                console.log(
+                    "  3. Verify the target contract exists and has the expected code"
+                );
+                revert("Simulation failed - see logs above for details");
             }
 
             console.log("  [SIMULATION SUCCESS]");
@@ -164,6 +173,59 @@ abstract contract SafeScriptBase is Script {
 
             console.log("  [PROPOSED] SafeTxHash:", vm.toString(result));
             currentNonce++;
+        }
+
+        return result;
+    }
+
+    /// @notice Propose or simulate a transaction with expected deployment verification
+    /// @dev Use this for CREATE2/CREATE3 deployments to verify the deployment succeeded
+    /// @param target The target contract address (e.g., CreateX)
+    /// @param data The calldata to send
+    /// @param expectedDeployment The address where we expect code to be deployed
+    /// @param description Human-readable description for logging
+    function _proposeTransactionWithVerification(
+        address target,
+        bytes memory data,
+        address expectedDeployment,
+        string memory description
+    ) internal returns (bytes32) {
+        console.log("  Expected deployment at:", expectedDeployment);
+
+        // Check if already deployed
+        if (expectedDeployment.code.length > 0) {
+            console.log(
+                "  [SKIP] Already deployed with",
+                expectedDeployment.code.length,
+                "bytes of code"
+            );
+            return bytes32(uint256(2)); // Return 2 to indicate "already deployed"
+        }
+
+        bytes32 result = _proposeTransaction(target, data, description);
+
+        // In simulation mode, verify the deployment actually happened
+        if (_isSimulation && result == bytes32(uint256(1))) {
+            if (expectedDeployment.code.length == 0) {
+                console.log("");
+                console.log("  [WARNING] Deployment verification failed!");
+                console.log("  Expected code at:", expectedDeployment);
+                console.log("  But address has no code after simulation.");
+                console.log("");
+                console.log("  This could mean:");
+                console.log("  - The CREATE2/CREATE3 call reverted internally");
+                console.log("  - The salt computation is wrong");
+                console.log("  - The bytecode hash doesn't match expectations");
+                revert(
+                    "Deployment verification failed - no code at expected address"
+                );
+            } else {
+                console.log(
+                    "  [VERIFIED] Code deployed:",
+                    expectedDeployment.code.length,
+                    "bytes"
+                );
+            }
         }
 
         return result;

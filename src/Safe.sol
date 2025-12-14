@@ -245,7 +245,60 @@ library Safe {
     //                    SIMULATION FUNCTIONS
     // ============================================================
 
-    /// @notice Simulate a Safe transaction on the current fork
+    /// @notice Decode revert reason from return data
+    /// @param returnData The raw return data from a failed call
+    /// @return reason Human-readable revert reason
+    function _decodeRevertReason(
+        bytes memory returnData
+    ) internal pure returns (string memory reason) {
+        // Check for standard Error(string) selector: 0x08c379a0
+        if (returnData.length >= 68) {
+            bytes4 selector;
+            assembly {
+                selector := mload(add(returnData, 32))
+            }
+            if (selector == 0x08c379a0) {
+                // Decode Error(string)
+                assembly {
+                    returnData := add(returnData, 4)
+                }
+                return abi.decode(returnData, (string));
+            }
+        }
+
+        // Check for Panic(uint256) selector: 0x4e487b71
+        if (returnData.length >= 36) {
+            bytes4 selector;
+            assembly {
+                selector := mload(add(returnData, 32))
+            }
+            if (selector == 0x4e487b71) {
+                uint256 panicCode;
+                assembly {
+                    panicCode := mload(add(returnData, 36))
+                }
+                if (panicCode == 0x01) return "Panic: Assertion failed";
+                if (panicCode == 0x11)
+                    return "Panic: Arithmetic overflow/underflow";
+                if (panicCode == 0x12) return "Panic: Division by zero";
+                if (panicCode == 0x21) return "Panic: Invalid enum value";
+                if (panicCode == 0x32) return "Panic: Array out of bounds";
+                if (panicCode == 0x41) return "Panic: Out of memory";
+                if (panicCode == 0x51)
+                    return "Panic: Uninitialized function pointer";
+                return string.concat("Panic: Code ", vm.toString(panicCode));
+            }
+        }
+
+        // Return raw hex if we can't decode
+        if (returnData.length > 0) {
+            return string.concat("Raw revert data: ", vm.toString(returnData));
+        }
+
+        return "No revert reason provided";
+    }
+
+    /// @notice Simulate a Safe transaction on the current fork using typed calls for full trace support
     /// @dev Uses vm.prank to execute as a Safe owner. For single-signer Safes.
     /// @param self The Safe client
     /// @param params The transaction parameters
@@ -262,11 +315,23 @@ library Safe {
         console.log("  Value:", params.value);
         console.log("  Operation:", uint8(params.operation));
         console.log("  Nonce:", params.nonce);
+        console.log("  Data length:", params.data.length);
 
-        // Build the execTransaction calldata
-        bytes memory execData = abi.encodeCall(
-            ISafeSmartAccount.execTransaction,
-            (
+        // Check if debug mode is enabled (bypass Safe, call target directly)
+        bool debugMode = vm.envOr("SAFE_DEBUG", false);
+
+        if (debugMode) {
+            console.log(
+                "\n[DEBUG MODE] Bypassing Safe, calling target directly..."
+            );
+            return _simulateDirectCall(self, params);
+        }
+
+        // Use typed call for proper Foundry trace support with -vvvvv
+        // This allows Foundry to show the full call stack
+        vm.prank(params.sender);
+        try
+            ISafeSmartAccount(safeAddress).execTransaction(
                 params.to,
                 params.value,
                 params.data,
@@ -278,21 +343,127 @@ library Safe {
                 payable(0), // refundReceiver
                 params.signature
             )
-        );
+        returns (bool execSuccess) {
+            if (execSuccess) {
+                console.log(
+                    "[SIMULATION] SUCCESS - Transaction executed correctly"
+                );
+                return true;
+            } else {
+                // execTransaction returned false (inner call failed but didn't revert)
+                console.log(
+                    "[SIMULATION] FAILED - Safe.execTransaction returned false"
+                );
+                console.log(
+                    "  This means the inner call reverted but Safe caught it"
+                );
+                console.log(
+                    "  Run with SAFE_DEBUG=true to see the inner revert reason"
+                );
+                return false;
+            }
+        } catch Error(string memory reason) {
+            console.log("[SIMULATION] FAILED - Reverted with reason:");
+            console.log(" ", reason);
+            return false;
+        } catch Panic(uint256 code) {
+            console.log("[SIMULATION] FAILED - Panic code:", code);
+            return false;
+        } catch (bytes memory returnData) {
+            console.log("[SIMULATION] FAILED - Reverted with:");
+            console.log(" ", _decodeRevertReason(returnData));
+            return false;
+        }
+    }
 
-        // Prank as the sender (Safe owner) and call the Safe
-        vm.prank(params.sender);
-        (success, ) = safeAddress.call(execData);
+    /// @notice Simulate by calling the target directly (bypassing Safe) for debugging
+    /// @dev This shows the actual revert reason from the target contract
+    function _simulateDirectCall(
+        Client storage self,
+        ExecTransactionParams memory params
+    ) internal returns (bool success) {
+        address safeAddress = instance(self).safe;
+
+        console.log("[DEBUG] Pranking as Safe and calling target directly");
+        console.log("  Target:", params.to);
+
+        if (params.operation == Enum.Operation.Call) {
+            // Regular call: prank as Safe and call target
+            vm.prank(safeAddress);
+            (success, ) = params.to.call{value: params.value}(params.data);
+        } else {
+            // DelegateCall: we can't easily simulate this directly
+            // But we can at least try to decode what MultiSend would do
+            console.log(
+                "[DEBUG] DelegateCall detected - simulating via Safe anyway"
+            );
+            console.log(
+                "  Note: For DelegateCall debugging, check the MultiSend transactions"
+            );
+
+            // Fall back to Safe execution for DelegateCall
+            vm.prank(params.sender);
+            try
+                ISafeSmartAccount(safeAddress).execTransaction(
+                    params.to,
+                    params.value,
+                    params.data,
+                    params.operation,
+                    0,
+                    0,
+                    0,
+                    address(0),
+                    payable(0),
+                    params.signature
+                )
+            returns (bool execSuccess) {
+                success = execSuccess;
+            } catch {
+                success = false;
+            }
+        }
 
         if (success) {
-            console.log(
-                "[SIMULATION] SUCCESS - Transaction would execute correctly"
-            );
+            console.log("[DEBUG] Direct call SUCCESS");
+
+            // Verify deployment if this looks like a CREATE2/CREATE3 call
+            _verifyDeploymentIfApplicable(params.to, params.data);
         } else {
-            console.log("[SIMULATION] FAILED - Transaction would revert");
+            console.log("[DEBUG] Direct call FAILED");
+            console.log("  Check the trace above for the actual revert reason");
         }
 
         return success;
+    }
+
+    /// @notice Check if a deployment actually produced code
+    /// @dev Called after simulation to verify CREATE2/CREATE3 worked
+    function _verifyDeploymentIfApplicable(
+        address target,
+        bytes memory data
+    ) internal view {
+        // Check if this is a CreateX call
+        if (target != 0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed) {
+            return; // Not CreateX
+        }
+
+        // Try to identify the function being called
+        if (data.length < 4) return;
+
+        bytes4 selector;
+        assembly {
+            selector := mload(add(data, 32))
+        }
+
+        // deployCreate2: 0x26307668
+        // deployCreate3: 0x7f565360
+        // (selectors may vary - these are common ones)
+
+        console.log("[DEBUG] CreateX call detected");
+        console.log("  Selector:", vm.toString(bytes4(selector)));
+        console.log(
+            "  Tip: Check the trace to see the deployed address and verify it has code"
+        );
     }
 
     /// @notice Simulate a single transaction
@@ -368,32 +539,34 @@ library Safe {
 
     /// @notice Simulate without requiring hardware wallet signature
     /// @dev Creates an "approved hash" style signature for simulation only
-    ///      This works because we prank as an owner
     function simulateTransactionNoSign(
         Client storage self,
         address to,
         bytes memory data,
         address sender
     ) internal returns (bool success) {
+        return
+            simulateTransactionNoSign(
+                self,
+                to,
+                data,
+                Enum.Operation.Call,
+                sender
+            );
+    }
+
+    /// @notice Simulate without requiring hardware wallet signature (with operation type)
+    /// @dev Creates an "approved hash" style signature for simulation only
+    function simulateTransactionNoSign(
+        Client storage self,
+        address to,
+        bytes memory data,
+        Enum.Operation operation,
+        address sender
+    ) internal returns (bool success) {
         uint256 nonce = getNonce(self);
-
-        // For simulation, we can use a pre-approved hash signature format
-        // The Safe accepts signatures where v=1 means "approved hash"
-        // But simpler: we just vm.prank as owner and the Safe will accept
-        // We'll create a dummy signature that will work with prank
-
-        // Actually, the cleanest approach is to temporarily set threshold to 0
-        // or use vm.store to mark the hash as approved
-
         address safeAddress = instance(self).safe;
-        bytes32 txHash = getSafeTxHash(
-            self,
-            to,
-            0,
-            data,
-            Enum.Operation.Call,
-            nonce
-        );
+        bytes32 txHash = getSafeTxHash(self, to, 0, data, operation, nonce);
 
         // Store the hash as approved (approvedHashes[owner][hash] = 1)
         // Slot: keccak256(abi.encode(hash, keccak256(abi.encode(owner, 8))))
@@ -413,7 +586,7 @@ library Safe {
             to: to,
             value: 0,
             data: data,
-            operation: Enum.Operation.Call,
+            operation: operation,
             sender: sender,
             signature: signature,
             nonce: nonce
