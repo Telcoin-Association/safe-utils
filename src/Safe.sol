@@ -645,6 +645,141 @@ library Safe {
     }
 
     // ============================================================
+    //              MULTI-SIG SIMULATION FUNCTIONS
+    // ============================================================
+
+    /// @notice Sort addresses in ascending order (required by Safe signature ordering)
+    /// @param arr Array of addresses to sort
+    /// @return The sorted array (modifies in place and returns)
+    function _sortAddresses(
+        address[] memory arr
+    ) internal pure returns (address[] memory) {
+        uint256 n = arr.length;
+        for (uint256 i = 0; i < n; i++) {
+            for (uint256 j = i + 1; j < n; j++) {
+                if (uint160(arr[i]) > uint160(arr[j])) {
+                    (arr[i], arr[j]) = (arr[j], arr[i]);
+                }
+            }
+        }
+        return arr;
+    }
+
+    /// @notice Simulate a transaction with multiple signers (for threshold > 1)
+    /// @dev Approves the tx hash for all signers and constructs concatenated signatures
+    /// @param self The Safe client
+    /// @param to Target address
+    /// @param data Calldata
+    /// @param operation Call or DelegateCall
+    /// @param signers Array of signer addresses (must be valid owners, length >= threshold)
+    /// @return success Whether the simulation succeeded
+    function simulateTransactionMultiSig(
+        Client storage self,
+        address to,
+        bytes memory data,
+        Enum.Operation operation,
+        address[] memory signers
+    ) internal returns (bool success) {
+        uint256 nonce = getNonce(self);
+        address safeAddress = instance(self).safe;
+        bytes32 txHash = getSafeTxHash(self, to, 0, data, operation, nonce);
+
+        // Sort signers by address (ascending) - Safe requires this
+        address[] memory sortedSigners = _sortAddresses(signers);
+
+        console.log(
+            "\n[SIMULATION] Multi-sig transaction with",
+            sortedSigners.length,
+            "signers"
+        );
+
+        // Store approved hash for each signer
+        for (uint256 i = 0; i < sortedSigners.length; i++) {
+            // approvedHashes mapping is at slot 8 in Safe
+            // approvedHashes[owner][hash] => slot = keccak256(hash, keccak256(owner, 8))
+            bytes32 ownerSlot = keccak256(
+                abi.encode(sortedSigners[i], uint256(8))
+            );
+            bytes32 approvalSlot = keccak256(abi.encode(txHash, ownerSlot));
+            vm.store(safeAddress, approvalSlot, bytes32(uint256(1)));
+            console.log("  Approved hash for signer:", sortedSigners[i]);
+        }
+
+        // Build concatenated signatures (must be in sorted address order)
+        // Each signature is 65 bytes: r (32) + s (32) + v (1)
+        bytes memory signatures;
+        for (uint256 i = 0; i < sortedSigners.length; i++) {
+            signatures = abi.encodePacked(
+                signatures,
+                bytes32(uint256(uint160(sortedSigners[i]))), // r = signer address padded
+                bytes32(0), // s = 0
+                uint8(1) // v = 1 (approved hash type)
+            );
+        }
+
+        ExecTransactionParams memory params = ExecTransactionParams({
+            to: to,
+            value: 0,
+            data: data,
+            operation: operation,
+            sender: sortedSigners[0], // First signer as the tx sender
+            signature: signatures,
+            nonce: nonce
+        });
+
+        return simulateTransaction(self, params);
+    }
+
+    /// @notice Simulate a single transaction with multiple signers (no HW wallet needed)
+    /// @param self The Safe client
+    /// @param to Target address
+    /// @param data Calldata
+    /// @param signers Array of signer addresses
+    /// @return success Whether the simulation succeeded
+    function simulateTransactionMultiSigNoSign(
+        Client storage self,
+        address to,
+        bytes memory data,
+        address[] memory signers
+    ) internal returns (bool success) {
+        return
+            simulateTransactionMultiSig(
+                self,
+                to,
+                data,
+                Enum.Operation.Call,
+                signers
+            );
+    }
+
+    /// @notice Simulate batched transactions with multiple signers (no HW wallet needed)
+    /// @param self The Safe client
+    /// @param targets Array of target addresses
+    /// @param datas Array of calldatas
+    /// @param signers Array of signer addresses
+    /// @return success Whether the simulation succeeded
+    function simulateTransactionsMultiSigNoSign(
+        Client storage self,
+        address[] memory targets,
+        bytes[] memory datas,
+        address[] memory signers
+    ) internal returns (bool success) {
+        (address to, bytes memory data) = getProposeTransactionsTargetAndData(
+            self,
+            targets,
+            datas
+        );
+        return
+            simulateTransactionMultiSig(
+                self,
+                to,
+                data,
+                Enum.Operation.DelegateCall,
+                signers
+            );
+    }
+
+    // ============================================================
     //          UNIFIED EXECUTE/PROPOSE (AUTO-DETECTS MODE)
     // ============================================================
 
@@ -980,6 +1115,15 @@ library Safe {
     }
 
     /// @notice Propose multiple transactions with a precomputed signature and explicit nonce
+    /// @dev    Use this when proposing multiple transactions in sequence to avoid nonce conflicts
+    ///
+    /// @param  self        The Safe client
+    /// @param  targets     The list of target addresses for the transactions
+    /// @param  datas       The list of data payloads for the transactions
+    /// @param  sender      The address of the account that is proposing the transactions
+    /// @param  signature   The precomputed signature for the batch of transactions
+    /// @param  nonce       The explicit nonce to use
+    /// @return txHash      The hash of the proposed Safe transaction
     function proposeTransactionsWithSignature(
         Client storage self,
         address[] memory targets,
@@ -993,6 +1137,7 @@ library Safe {
             targets,
             datas
         );
+        // using DelegateCall to preserve msg.sender across sub-calls
         ExecTransactionParams memory params = ExecTransactionParams({
             to: to,
             value: 0,

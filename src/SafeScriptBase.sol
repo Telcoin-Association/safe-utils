@@ -29,12 +29,25 @@ import {Enum} from "safe-smart-account/common/Enum.sol";
  *   - Proposes transactions to Safe Transaction Service API
  *   - Requires manual execution in Safe UI
  *
- * ENVIRONMENT VARIABLES:
- * ======================
+ * ENVIRONMENT VARIABLES (Single Signer):
+ * ======================================
  *   DEPLOYER_SAFE_ADDRESS - The Gnosis Safe address
  *   SIGNER_ADDRESS        - The signer's address (owner on the Safe)
  *   DERIVATION_PATH       - HW wallet derivation path (e.g., "m/44'/60'/0'/0/0")
  *   HARDWARE_WALLET       - "trezor" or "ledger" (default: "ledger")
+ *
+ * ENVIRONMENT VARIABLES (Multi-Sig Simulation):
+ * =============================================
+ *   DEPLOYER_SAFE_ADDRESS - The Gnosis Safe address
+ *   SIGNER_ADDRESS_0      - First signer address
+ *   SIGNER_ADDRESS_1      - Second signer address
+ *   SIGNER_ADDRESS_2      - Third signer address (and so on...)
+ *   DERIVATION_PATH       - HW wallet derivation path for primary signer (broadcast mode)
+ *   HARDWARE_WALLET       - "trezor" or "ledger" (default: "ledger")
+ *
+ * Note: For multi-sig, provide at least `threshold` number of signers.
+ *       In broadcast mode, only the primary signer (index 0) signs and proposes.
+ *       Other signatures are collected via the Safe UI.
  */
 abstract contract SafeScriptBase is Script {
     using Safe for *;
@@ -49,8 +62,11 @@ abstract contract SafeScriptBase is Script {
     /// @notice The deployer Safe address
     address internal deployerSafeAddress;
 
-    /// @notice The signer address (Safe owner)
+    /// @notice The signer address (Safe owner) - primary signer for broadcast
     address internal signer;
+
+    /// @notice Array of signers for multi-sig simulation
+    address[] internal signers;
 
     /// @notice The derivation path for HW wallet
     string internal derivationPath;
@@ -120,12 +136,79 @@ abstract contract SafeScriptBase is Script {
         }
     }
 
+    /// @notice Initialize Safe client with multiple signers for multi-sig Safes
+    /// @dev Set SIGNER_ADDRESS_0, SIGNER_ADDRESS_1, etc. in environment
+    ///      Falls back to SIGNER_ADDRESS if no indexed signers found
+    function _initializeSafeMultiSig() internal {
+        deployerSafeAddress = vm.envAddress("DEPLOYER_SAFE_ADDRESS");
+        safe.initialize(deployerSafeAddress);
+
+        // Load signers from indexed env vars: SIGNER_ADDRESS_0, SIGNER_ADDRESS_1, ...
+        uint256 i = 0;
+        while (true) {
+            string memory envKey = string.concat(
+                "SIGNER_ADDRESS_",
+                vm.toString(i)
+            );
+            address signerAddr = vm.envOr(envKey, address(0));
+            if (signerAddr == address(0)) break;
+            signers.push(signerAddr);
+            i++;
+        }
+
+        // Fallback to single signer if no indexed signers found
+        if (signers.length == 0) {
+            signer = vm.envAddress("SIGNER_ADDRESS");
+            signers.push(signer);
+        } else {
+            signer = signers[0]; // Primary signer for broadcast mode
+        }
+
+        derivationPath = vm.envOr("DERIVATION_PATH", string(""));
+        _isSimulation = Safe.isSimulationMode();
+
+        _logModeMultiSig();
+    }
+
+    /// @notice Log mode with multi-sig details
+    function _logModeMultiSig() internal view {
+        console.log("\n========================================");
+        if (_isSimulation) {
+            console.log("    SIMULATION MODE (Multi-Sig)");
+            console.log("  (no --broadcast flag detected)");
+            console.log("");
+            console.log("  Transactions will execute on fork");
+            console.log("  Simulating", signers.length, "signers");
+        } else {
+            console.log("        BROADCAST MODE");
+            console.log("   (--broadcast flag detected)");
+            console.log("");
+            console.log("  Transactions will be proposed to Safe API");
+            console.log("  Primary signer will sign with HW wallet");
+        }
+        console.log("========================================\n");
+
+        console.log("Safe Address:", deployerSafeAddress);
+        console.log("Signers:", signers.length);
+        for (uint256 i = 0; i < signers.length; i++) {
+            if (i == 0 && !_isSimulation) {
+                console.log("  [PRIMARY]", i, ":", signers[i]);
+            } else {
+                console.log("          ", i, ":", signers[i]);
+            }
+        }
+        if (!_isSimulation && bytes(derivationPath).length > 0) {
+            console.log("Derivation Path:", derivationPath);
+        }
+    }
+
     // ============================================================
     //                  TRANSACTION HELPERS
     // ============================================================
 
     /// @notice Propose or simulate a single transaction
     /// @dev Automatically chooses based on broadcast mode
+    ///      Uses multi-sig simulation if multiple signers are configured
     /// @param target The target contract address
     /// @param data The calldata to send
     /// @param description Human-readable description for logging
@@ -140,8 +223,18 @@ abstract contract SafeScriptBase is Script {
         bytes32 result;
 
         if (_isSimulation) {
-            // Simulation mode: execute directly on fork
-            bool success = safe.simulateTransactionNoSign(target, data, signer);
+            bool success;
+
+            // Use multi-sig simulation if we have multiple signers
+            if (signers.length > 1) {
+                success = safe.simulateTransactionMultiSigNoSign(
+                    target,
+                    data,
+                    signers
+                );
+            } else {
+                success = safe.simulateTransactionNoSign(target, data, signer);
+            }
 
             if (!success) {
                 console.log("  [SIMULATION FAILED] Transaction would revert!");
@@ -165,7 +258,6 @@ abstract contract SafeScriptBase is Script {
             currentNonce++;
         } else {
             // Broadcast mode: propose to Safe API with explicit nonce
-            // (on-chain nonce doesn't increment until tx is executed)
             bytes memory signature = safe.sign(
                 target,
                 data,
@@ -245,6 +337,7 @@ abstract contract SafeScriptBase is Script {
 
     /// @notice Propose or simulate multiple transactions as a batch
     /// @dev Uses MultiSend for atomic execution
+    ///      Uses multi-sig simulation if multiple signers are configured
     /// @param targets Array of target addresses
     /// @param datas Array of calldatas
     /// @param description Human-readable description for logging
@@ -259,11 +352,22 @@ abstract contract SafeScriptBase is Script {
         bytes32 result;
 
         if (_isSimulation) {
-            bool success = safe.simulateTransactionsNoSign(
-                targets,
-                datas,
-                signer
-            );
+            bool success;
+
+            // Use multi-sig simulation if we have multiple signers
+            if (signers.length > 1) {
+                success = safe.simulateTransactionsMultiSigNoSign(
+                    targets,
+                    datas,
+                    signers
+                );
+            } else {
+                success = safe.simulateTransactionsNoSign(
+                    targets,
+                    datas,
+                    signer
+                );
+            }
 
             if (!success) {
                 console.log("  [SIMULATION FAILED] Batch would revert!");
@@ -274,6 +378,7 @@ abstract contract SafeScriptBase is Script {
             result = bytes32(uint256(1));
             currentNonce++;
         } else {
+            // Broadcast mode: propose to Safe API with explicit nonce
             (address to, bytes memory data) = safe
                 .getProposeTransactionsTargetAndData(targets, datas);
 
@@ -318,5 +423,20 @@ abstract contract SafeScriptBase is Script {
     /// @notice Get the Safe address
     function getSafeAddress() internal view returns (address) {
         return deployerSafeAddress;
+    }
+
+    /// @notice Get all configured signers
+    function getSigners() internal view returns (address[] memory) {
+        return signers;
+    }
+
+    /// @notice Get the number of signers
+    function getSignerCount() internal view returns (uint256) {
+        return signers.length;
+    }
+
+    /// @notice Check if running in multi-sig mode
+    function isMultiSig() internal view returns (bool) {
+        return signers.length > 1;
     }
 }

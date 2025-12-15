@@ -32,6 +32,53 @@ forge script script/MyScript.s.sol \
   -vvvv
 ```
 
+## Multi-Sig Simulation
+
+For Safes with threshold > 1, you can simulate with multiple signers:
+
+### Multi-Sig Simulation Mode
+```bash
+DEPLOYER_SAFE_ADDRESS=0x... \
+SIGNER_ADDRESS_0=0xAlice... \
+SIGNER_ADDRESS_1=0xBob... \
+SIGNER_ADDRESS_2=0xCharlie... \
+forge script script/MyScript.s.sol \
+  --rpc-url $RPC_URL \
+  --ffi \
+  -vvvv
+```
+
+### How Multi-Sig Simulation Works
+1. Provide `threshold` or more signer addresses via indexed env vars
+2. The simulation approves the tx hash in Safe storage for ALL signers
+3. Signatures are sorted by address (as required by Safe)
+4. The concatenated multi-sig signature is constructed automatically
+
+### Multi-Sig Broadcast Mode
+```bash
+DEPLOYER_SAFE_ADDRESS=0x... \
+SIGNER_ADDRESS_0=0xAlice... \
+SIGNER_ADDRESS_1=0xBob... \
+DERIVATION_PATH="m/44'/60'/0'/0/0" \
+HARDWARE_WALLET=trezor \
+forge script script/MyScript.s.sol \
+  --rpc-url $RPC_URL \
+  --broadcast \
+  --ffi \
+  -vvvv
+```
+
+In broadcast mode, only the primary signer (index 0) signs and proposes. Other signatures are collected via the Safe UI.
+
+### Script Setup for Multi-Sig
+
+Use `_initializeSafeMultiSig()` instead of `_initializeSafe()`:
+
+```solidity
+function setUp() public {
+    _initializeSafeMultiSig();  // Loads SIGNER_ADDRESS_0, SIGNER_ADDRESS_1, etc.
+}
+
 ## How It Works
 
 ### Simulation Mode
@@ -147,6 +194,19 @@ bool success = safe.simulateTransactionNoSign(self, to, data, sender);
 
 // Simulate batch (NO HW wallet needed)
 bool success = safe.simulateTransactionsNoSign(self, targets, datas, sender);
+```
+
+### Multi-Sig Simulation Functions
+```solidity
+// Simulate single transaction with multiple signers
+address[] memory signers = new address[](3);
+signers[0] = 0xAlice;
+signers[1] = 0xBob;
+signers[2] = 0xCharlie;
+bool success = safe.simulateTransactionMultiSigNoSign(self, to, data, signers);
+
+// Simulate batch with multiple signers
+bool success = safe.simulateTransactionsMultiSigNoSign(self, targets, datas, signers);
 ```
 
 ### Unified Execute/Propose
