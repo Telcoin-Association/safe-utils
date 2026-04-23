@@ -1,15 +1,61 @@
-# Safe-Utils Simulation Support Migration Guide
+# Safe-Utils: Telcoin Additions Migration Guide
 
 ## Overview
 
-This update adds **simulation mode** to safe-utils, allowing you to test Safe deployments on a local fork without:
-- Hardware wallet (Trezor/Ledger) signing
-- Proposing to the Safe Transaction Service API
-- Any on-chain state changes
+This fork adds the following capabilities on top of `Recon-Fuzz/safe-utils`:
+
+1. **Simulation mode** — execute a Safe transaction against a local fork without hardware-wallet signing or Safe Transaction Service API proposal
+2. **Multi-sig simulation** — approve as N owners via storage manipulation to test threshold-based Safes
+3. **Hardware wallet selection** — `HARDWARE_WALLET` env var with Trezor support (Ledger remains default)
+4. **Deployment verification helper** — check CREATE2/CREATE3 deploys actually landed, with skip-if-already-deployed logic
+5. **`SafeScriptBase`** — ready-to-extend base contract that auto-detects mode and handles nonce tracking
+6. **Explicit-nonce signing/proposing** — new overloads that accept a custom nonce (breaking change on `proposeTransactionWithSignature`; additive elsewhere)
+
+`--ffi` is required for every run (both simulation and broadcast) because signing and Safe API calls go through FFI.
+
+---
+
+## Breaking Changes
+
+### `proposeTransactionWithSignature` now requires an explicit nonce
+
+**Before** (upstream):
+```solidity
+function proposeTransactionWithSignature(
+    Client storage self,
+    address to,
+    bytes memory data,
+    address sender,
+    bytes memory signature
+) internal returns (bytes32 txHash);
+```
+
+**After** (this fork):
+```solidity
+function proposeTransactionWithSignature(
+    Client storage self,
+    address to,
+    bytes memory data,
+    address sender,
+    bytes memory signature,
+    uint256 nonce
+) internal returns (bytes32 txHash);
+```
+
+Callers must pass the nonce they signed against. The previous implicit `getNonce(self)` behavior was replaced because proposing multiple sequential transactions in a single script run requires incrementing the nonce manually to avoid collisions — the Safe's on-chain nonce has not yet advanced when proposing (it only advances on execution).
+
+To keep the old behavior, pass `safe.getNonce()`:
+```solidity
+safe.proposeTransactionWithSignature(to, data, sender, signature, safe.getNonce());
+```
+
+The batch variant `proposeTransactionsWithSignature` is *additive* — both the no-nonce (4-arg signature payload) and with-nonce (5-arg signature payload) overloads exist.
+
+---
 
 ## Quick Start
 
-### Simulation Mode (No `--broadcast` flag)
+### Simulation Mode (no `--broadcast`)
 ```bash
 DEPLOYER_SAFE_ADDRESS=0x... \
 SIGNER_ADDRESS=0x... \
@@ -19,7 +65,7 @@ forge script script/MyScript.s.sol \
   -vvvv
 ```
 
-### Broadcast Mode (With `--broadcast` flag)
+### Broadcast Mode (with `--broadcast`)
 ```bash
 DEPLOYER_SAFE_ADDRESS=0x... \
 SIGNER_ADDRESS=0x... \
@@ -32,11 +78,28 @@ forge script script/MyScript.s.sol \
   -vvvv
 ```
 
+Mode is auto-detected via `vm.isContext(VmSafe.ForgeContext.ScriptBroadcast)`. You can override with `SAFE_BROADCAST=true|false` (see [Environment Variables](#environment-variables)).
+
+---
+
+## Simulation Mode
+
+When `--broadcast` is NOT passed:
+1. `isSimulationMode()` returns true.
+2. The tx hash is marked "approved" in the Safe's storage via `vm.store()` (writing to slot-8 `approvedHashes[owner][hash] = 1`).
+3. A synthetic "approved hash" signature (`r = owner, s = 0, v = 1`) is constructed.
+4. `execTransaction` is called **as the signer** (via `vm.prank`) against the Safe on the fork.
+5. Success/failure and resulting state changes are printed. On failure the call reverts with a decoded reason.
+
+This means simulation works on Safes you don't control — you don't need any private key, just the owner addresses.
+
+---
+
 ## Multi-Sig Simulation
 
-For Safes with threshold > 1, you can simulate with multiple signers:
+For Safes with threshold > 1, provide `threshold` or more signer addresses via indexed env vars.
 
-### Multi-Sig Simulation Mode
+### Simulation
 ```bash
 DEPLOYER_SAFE_ADDRESS=0x... \
 SIGNER_ADDRESS_0=0xAlice... \
@@ -48,13 +111,13 @@ forge script script/MyScript.s.sol \
   -vvvv
 ```
 
-### How Multi-Sig Simulation Works
-1. Provide `threshold` or more signer addresses via indexed env vars
-2. The simulation approves the tx hash in Safe storage for ALL signers
-3. Signatures are sorted by address (as required by Safe)
-4. The concatenated multi-sig signature is constructed automatically
+### How it works
+1. Each signer's slot-8 `approvedHashes` entry is set to 1.
+2. Signer addresses are sorted ascending (Safe requires sorted signatures).
+3. A 65-byte "approved hash" signature is built per signer and concatenated.
+4. `execTransaction` is called with the concatenated signatures.
 
-### Multi-Sig Broadcast Mode
+### Broadcast Mode with Multi-Sig
 ```bash
 DEPLOYER_SAFE_ADDRESS=0x... \
 SIGNER_ADDRESS_0=0xAlice... \
@@ -68,228 +131,329 @@ forge script script/MyScript.s.sol \
   -vvvv
 ```
 
-In broadcast mode, only the primary signer (index 0) signs and proposes. Other signatures are collected via the Safe UI.
+In broadcast mode, **only the primary signer (index 0) signs and proposes.** Remaining signatures are collected via the Safe UI by other owners.
 
-### Script Setup for Multi-Sig
-
+### Script Setup
 Use `_initializeSafeMultiSig()` instead of `_initializeSafe()`:
-
 ```solidity
 function setUp() public {
-    _initializeSafeMultiSig();  // Loads SIGNER_ADDRESS_0, SIGNER_ADDRESS_1, etc.
+    _initializeSafeMultiSig();  // Loads SIGNER_ADDRESS_0, SIGNER_ADDRESS_1, ...
 }
+```
+Falls back to `SIGNER_ADDRESS` if no indexed signers are present, so the same base works for single-signer scripts.
 
-## How It Works
+---
 
-### Simulation Mode
-When `--broadcast` is NOT passed:
-1. Detects simulation mode via `vm.isContext(VmSafe.ForgeContext.ScriptBroadcast)`
-2. Uses `vm.store()` to mark the transaction hash as "approved" in the Safe's storage
-3. Calls `execTransaction` directly on the Safe (on the fork)
-4. Shows success/failure and any state changes
+## Hardware Wallet Support
 
-### Broadcast Mode  
-When `--broadcast` IS passed:
-1. Detects broadcast mode
-2. Signs via Trezor/Ledger FFI (as before)
-3. Proposes to Safe Transaction Service API (as before)
+### `HARDWARE_WALLET` env var
 
-## Migration Steps
+| Value | Behavior |
+|---|---|
+| (unset) | Defaults to `ledger` |
+| `ledger` | `cast wallet sign --ledger --data <EIP-712 typed data>` |
+| `trezor` | `cast wallet sign --trezor <safeTxHash>` — raw hash, because `cast` does not support EIP-712 `--data` for Trezor |
 
-### 1. Update Safe.sol
+### Trezor-specific signature adjustment
 
-Replace your `Safe.sol` with the new version that includes:
-- `isBroadcastMode()` / `isSimulationMode()` detection
-- `simulateTransaction()` functions
-- `simulateTransactionNoSign()` functions
-- `executeOrPropose()` unified API
-
-### 2. Option A: Use SafeScriptBase (Recommended)
-
-Have your script base extend `SafeScriptBase`:
+Trezor uses `eth_sign` (which prepends `"\x19Ethereum Signed Message:\n32"` to the hash) rather than signing the raw hash directly. The Safe contract distinguishes this by checking the signature's `v` value: if `v >= 31`, it treats the message as `eth_sign`-prefixed. The library adds `4` to `v` after Trezor returns the signature so the Safe accepts it:
 
 ```solidity
-// Before
-abstract contract StablecoinScriptBase is Script {
-    using Safe for *;
-    Safe.Client internal safe;
-    
-    function setUp() public {
-        safe.initialize(vm.envAddress("DEPLOYER_SAFE_ADDRESS"));
-        // ...
-    }
-    
-    function _proposeTransaction(address target, bytes memory data, string memory desc) internal {
-        safe.proposeTransaction(target, data, signer, derivationPath);
-    }
-}
+bytes memory output = vm.ffi(inputs);
+uint8 v = uint8(output[64]);
+output[64] = bytes1(v + 4);
+return output;
+```
 
-// After
-import {SafeScriptBase} from "@safe-utils/SafeScriptBase.sol";
+Ledger signs the EIP-712 typed data natively, so no adjustment is needed.
 
-abstract contract StablecoinScriptBase is SafeScriptBase {
-    // SafeScriptBase already has:
-    // - Safe.Client internal safe;
-    // - address internal deployerSafeAddress;
-    // - address internal signer;
-    // - string internal derivationPath;
-    // - _proposeTransaction() with auto mode detection
-    
+### Signing without a hardware wallet
+Pass an empty `derivationPath` (or leave the env var unset). The library falls back to `vm.sign(sender, safeTxHash)`, useful for testing with known private keys loaded via `vm.rememberKey`.
+
+---
+
+## Deployment Verification Helper
+
+`SafeScriptBase` exposes `_proposeTransactionWithVerification()` for CREATE2/CREATE3 deployment scripts. It:
+
+1. **Skips** the transaction if `expectedDeployment.code.length > 0` (already deployed → idempotent).
+2. Runs the simulation/broadcast via the normal `_proposeTransaction()` path.
+3. In simulation, **verifies** code exists at `expectedDeployment` after execution. If not, reverts with a diagnostic about possible causes (reverted internally, wrong salt, wrong bytecode hash).
+
+```solidity
+bytes32 result = _proposeTransactionWithVerification(
+    createXAddress,     // target (e.g. CreateX factory)
+    createCalldata,     // CREATE3 calldata
+    expectedAddress,    // where we expect the contract to exist after
+    "Deploy MyToken"    // description for logs
+);
+```
+
+Return values:
+- `bytes32(uint256(1))` — simulation/broadcast succeeded
+- `bytes32(uint256(2))` — skipped (already deployed)
+- reverts on failure
+
+---
+
+## Integration
+
+### Option A: extend `SafeScriptBase` (recommended)
+```solidity
+import {SafeScriptBase} from "safe-utils/SafeScriptBase.sol";
+
+abstract contract MyScriptBase is SafeScriptBase {
     function setUp() public {
-        _initializeSafe();  // Handles everything!
-        // Your additional setup...
+        _initializeSafe();       // or _initializeSafeMultiSig()
+        // ...your setup...
+    }
+
+    function run() public {
+        _proposeTransaction(target, data, "Upgrade proxy");
+        _proposeTransaction(anotherTarget, moreData, "Set param");
+        // currentNonce auto-increments between calls
     }
 }
 ```
 
-### 3. Option B: Manual Integration
+`SafeScriptBase` gives you: `safe`, `deployerSafeAddress`, `signer`, `signers[]`, `derivationPath`, `currentNonce`, `_isSimulation`, and `onlySimulation` / `onlyBroadcast` modifiers.
 
-If you prefer to keep your existing structure:
-
+### Option B: manual integration
 ```solidity
-abstract contract StablecoinScriptBase is Script {
+abstract contract MyScriptBase is Script {
     using Safe for *;
     Safe.Client internal safe;
-    bool internal _isSimulation;
-    
+
     function setUp() public {
         safe.initialize(vm.envAddress("DEPLOYER_SAFE_ADDRESS"));
-        _isSimulation = safe.isSimulationMode();
-        // ...
     }
-    
-    function _proposeTransaction(
-        address target, 
-        bytes memory data, 
-        string memory desc
-    ) internal {
-        if (_isSimulation) {
-            // Simulation: execute on fork without HW wallet
-            bool success = safe.simulateTransactionNoSign(target, data, signer);
-            require(success, "Simulation failed");
+
+    function _proposeTransaction(address target, bytes memory data) internal {
+        if (Safe.isSimulationMode()) {
+            require(safe.simulateTransactionNoSign(target, data, signer), "sim failed");
         } else {
-            // Broadcast: propose to Safe API with HW wallet
             safe.proposeTransaction(target, data, signer, derivationPath);
         }
     }
 }
 ```
 
-## New Functions Reference
+---
+
+## API Reference
+
+All functions are in the `Safe` library and invoked via `using Safe for *;` unless noted. The `Client storage self` receiver is auto-passed and omitted from call-sites below.
 
 ### Mode Detection
 ```solidity
-// Check if --broadcast flag was passed
-bool broadcast = safe.isBroadcastMode();
-bool simulation = safe.isSimulationMode();
+bool Safe.isBroadcastMode();
+bool Safe.isSimulationMode();
 ```
+Both read `vm.isContext(VmSafe.ForgeContext.ScriptBroadcast)` with `SAFE_BROADCAST` as an env override. `isSimulationMode()` is simply `!isBroadcastMode()`.
 
-### Simulation Functions
+### Simulation — single transaction
 ```solidity
-// Simulate single transaction (requires HW wallet sig)
-bool success = safe.simulateTransaction(self, to, data, sender, derivationPath);
+// With hardware-wallet signing
+bool success = safe.simulateTransaction(to, data, sender, derivationPath);
 
-// Simulate single transaction (NO HW wallet needed - uses storage manipulation)
-bool success = safe.simulateTransactionNoSign(self, to, data, sender);
+// No signing — approves via storage manipulation
+bool success = safe.simulateTransactionNoSign(to, data, sender);
+bool success = safe.simulateTransactionNoSign(to, data, operation, sender);
 
-// Simulate batch (NO HW wallet needed)
-bool success = safe.simulateTransactionsNoSign(self, targets, datas, sender);
+// Low-level entry with pre-built params
+bool success = safe.simulateTransaction(execTransactionParams);
 ```
 
-### Multi-Sig Simulation Functions
+### Simulation — batched transactions (MultiSend, DelegateCall)
 ```solidity
-// Simulate single transaction with multiple signers
-address[] memory signers = new address[](3);
-signers[0] = 0xAlice;
-signers[1] = 0xBob;
-signers[2] = 0xCharlie;
-bool success = safe.simulateTransactionMultiSigNoSign(self, to, data, signers);
-
-// Simulate batch with multiple signers
-bool success = safe.simulateTransactionsMultiSigNoSign(self, targets, datas, signers);
+bool success = safe.simulateTransactions(targets, datas, sender, derivationPath);
+bool success = safe.simulateTransactionsNoSign(targets, datas, sender);
 ```
 
-### Unified Execute/Propose
+### Simulation — multi-sig
 ```solidity
-// Automatically chooses simulation or propose based on mode
-bytes32 result = safe.executeOrPropose(self, to, data, sender, derivationPath);
-bytes32 result = safe.executeOrProposeMulti(self, targets, datas, sender, derivationPath);
+// With hardware-wallet signing (signers must each have a signature; primary signs via FFI)
+bool success = safe.simulateTransactionMultiSig(to, data, operation, signers);
+
+// No signing — all signers marked "approved hash" in storage
+bool success = safe.simulateTransactionMultiSigNoSign(to, data, signers);
+bool success = safe.simulateTransactionsMultiSigNoSign(targets, datas, signers);
 ```
+
+### Unified execute-or-propose (auto-detects mode)
+```solidity
+// Simulation → execute on fork with approved-hash. Broadcast → propose to Safe API.
+bytes32 result = safe.executeOrPropose(to, data, sender, derivationPath);
+bytes32 result = safe.executeOrProposeMulti(targets, datas, sender, derivationPath);
+```
+Returns the `safeTxHash` in broadcast mode, or `bytes32(uint256(1))` (success) / `bytes32(0)` (failure) in simulation.
+
+### Propose (broadcast)
+```solidity
+// Sign + propose in one call
+bytes32 hash = safe.proposeTransaction(to, data, sender);                    // no HW wallet (vm.sign)
+bytes32 hash = safe.proposeTransaction(to, data, sender, derivationPath);    // HW wallet
+
+// Propose with pre-computed signature and explicit nonce (breaking change — see above)
+bytes32 hash = safe.proposeTransactionWithSignature(to, data, sender, signature, nonce);
+
+// Batch variants
+bytes32 hash = safe.proposeTransactions(targets, datas, sender, derivationPath);
+bytes32 hash = safe.proposeTransactionsWithSignature(targets, datas, sender, signature);          // upstream-compatible
+bytes32 hash = safe.proposeTransactionsWithSignature(targets, datas, sender, signature, nonce);   // new overload
+```
+
+### Signing
+```solidity
+bytes memory sig = safe.sign(to, data, operation, sender, derivationPath);              // uses current nonce
+bytes memory sig = safe.sign(to, data, operation, sender, nonce, derivationPath);       // custom nonce
+```
+
+### Custom Errors
+```solidity
+error SimulationFailed(string reason);
+error ExecTransactionFailed(bytes returnData);
+// Plus existing upstream errors:
+error ApiKitUrlNotFound(uint256 chainId);
+error MultiSendCallOnlyNotFound(uint256 chainId);
+error ArrayLengthsMismatch(uint256 a, uint256 b);
+error ProposeTransactionFailed(uint256 statusCode, string response);
+```
+
+---
+
+## `SafeScriptBase` Reference
+
+### State
+| Variable | Purpose |
+|---|---|
+| `Safe.Client internal safe` | The Safe client instance |
+| `address internal deployerSafeAddress` | The Safe address from `DEPLOYER_SAFE_ADDRESS` |
+| `address internal signer` | Primary signer (first, or `SIGNER_ADDRESS`) |
+| `address[] internal signers` | All configured signers (multi-sig) |
+| `string internal derivationPath` | HW wallet path (empty in simulation) |
+| `uint256 internal currentNonce` | Auto-incrementing nonce across calls in one script run |
+| `bool internal _isSimulation` | Cached simulation-mode flag |
+
+### Setup
+```solidity
+_initializeSafe();           // single signer
+_initializeSafeMultiSig();   // multi-sig (falls back to single if no indexed signers)
+```
+
+### Transaction helpers
+```solidity
+bytes32 _proposeTransaction(target, data, description);
+bytes32 _proposeTransactionWithVerification(target, data, expectedDeployment, description);
+bytes32 _proposeTransactions(targets, datas, description);
+```
+
+### Modifiers
+```solidity
+modifier onlySimulation();  // reverts if running in broadcast
+modifier onlyBroadcast();   // reverts if running in simulation
+```
+
+### Utility getters
+```solidity
+bool    isSimulation();
+uint256 getSafeNonce();
+address getSafeAddress();
+address[] getSigners();
+uint256 getSignerCount();
+bool    isMultiSig();
+```
+
+---
+
+## Environment Variables
+
+### Safe configuration
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DEPLOYER_SAFE_ADDRESS` | yes | — | The Gnosis Safe address |
+| `SIGNER_ADDRESS` | single-signer | — | Signer address (owner on the Safe) |
+| `SIGNER_ADDRESS_0`, `SIGNER_ADDRESS_1`, ... | multi-sig | — | Indexed signer addresses. Used by `_initializeSafeMultiSig()` |
+| `DERIVATION_PATH` | broadcast only | `""` | HW wallet derivation path, e.g. `m/44'/60'/0'/0/0` |
+| `HARDWARE_WALLET` | no | `ledger` | `ledger` or `trezor` |
+
+### Mode / debugging
+| Variable | Default | Description |
+|---|---|---|
+| `SAFE_BROADCAST` | auto-detected | Force broadcast mode (`true`) or simulation mode (`false`), overriding the Forge context detection |
+| `SAFE_DEBUG` | `false` | In simulation, bypass the Safe and call the target contract directly. Reveals the inner revert reason. Only works for `Call` operations (not `DelegateCall`/MultiSend) |
+
+---
+
+## Debug Mode (`SAFE_DEBUG=true`)
+
+When enabled and running in simulation, the library skips `Safe.execTransaction` and calls the target contract directly via `vm.prank(sender)`. This is useful when `execTransaction` returns `false` without telling you why — calling the target directly surfaces the native revert reason.
+
+Caveats:
+- Only works for `Call` operation. Batched/MultiSend transactions (`DelegateCall`) are not supported in debug mode because they rely on being executed through the Safe.
+- Any Safe-specific checks (nonce, threshold, signature validity, refund logic) are bypassed — don't use this to validate Safe behavior, only to debug the target call.
+
+---
 
 ## Troubleshooting
 
 ### "Simulation failed" error
 The transaction would revert on-chain. To debug:
 
-1. **Enable debug mode** to bypass Safe and see the actual revert:
+1. Enable debug mode to bypass Safe and see the native revert:
    ```bash
-   SAFE_DEBUG=true forge script ... -vvvvv
+   SAFE_DEBUG=true forge script ... --ffi -vvvvv
    ```
-
-2. **Check the full trace** with maximum verbosity:
+2. Maximize verbosity for full stack traces (simulation uses typed calls, so traces include the Safe → target chain):
    ```bash
-   forge script ... -vvvvv
+   forge script ... --ffi -vvvvv
    ```
-   The typed calls in simulation mode now produce full stack traces.
-
-3. **Verify your targets exist**:
-   - Is CreateX deployed on this chain?
-   - Does the implementation contract exist before deploying a beacon/proxy pointing to it?
+3. Verify the target contract exists on the forked chain.
 
 ### Deployment verification failed
-If you see "no code at expected address":
-- The CREATE2/CREATE3 salt computation may be wrong
-- The bytecode hash may not match expectations
-- The inner deployment reverted (check trace with `SAFE_DEBUG=true`)
+If `_proposeTransactionWithVerification` reverts with "no code at expected address":
+- The CREATE2/CREATE3 salt computation is wrong
+- The bytecode hash doesn't match expectations
+- The inner deployment reverted (use `SAFE_DEBUG=true` to see why)
 
 ### Mode not detected correctly
-Set fallback environment variable:
 ```bash
-SAFE_BROADCAST=true forge script ...  # Force broadcast mode
-SAFE_BROADCAST=false forge script ... # Force simulation mode
+SAFE_BROADCAST=true forge script ...   # force broadcast
+SAFE_BROADCAST=false forge script ...  # force simulation
 ```
 
 ### Getting full stack traces
-The simulation now uses **typed calls** instead of low-level `.call()`, which means Foundry's `-vvvvv` flag will show the complete call stack including:
-- Safe's `execTransaction` 
-- The target contract's function
-- Any internal calls and reverts
-
-Example output with `-vvvvv`:
+Simulation uses typed calls (`ISafeSmartAccount(safe).execTransaction(...)` via `try/catch`) instead of low-level `.call()`, so Foundry's `-vvvvv` shows the full stack:
 ```
 ├─ [123456] Safe::execTransaction(...)
 │   ├─ [98765] CreateX::deployCreate3(...)
 │   │   ├─ [54321] → new MyContract(...)
 │   │   │   └─ ← [Revert] SomeError()
-│   │   └─ ← [Revert] 
+│   │   └─ ← [Revert]
 │   └─ ← false
 ```
 
-### Debug mode (`SAFE_DEBUG=true`)
-When enabled, simulation bypasses the Safe and calls the target directly:
-- Shows the actual revert reason from the target (not wrapped by Safe)
-- Useful when Safe's `execTransaction` returns `false` but doesn't tell you why
-- Only works for `Call` operations (not `DelegateCall`/MultiSend)
+### Nonce conflicts when proposing multiple transactions
+When proposing multiple transactions in one script run, the Safe's on-chain nonce hasn't advanced yet (it only advances on execution). `SafeScriptBase` tracks `currentNonce` and increments it per propose call. If integrating manually, pass an explicit incrementing nonce into `sign()` and `proposeTransactionWithSignature()`.
 
-### Nonce issues in simulation
-In simulation mode, each `execTransaction` increments the Safe's nonce. If you're doing multiple transactions, the simulation handles this automatically.
+---
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     Your Script                              │
+│                     Your Script                             │
 │  ┌─────────────────────────────────────────────────────┐    │
-│  │              SafeScriptBase                          │    │
+│  │              SafeScriptBase                         │    │
 │  │  ┌─────────────────────────────────────────────┐    │    │
-│  │  │              Safe.sol Library                │    │    │
-│  │  │                                              │    │    │
+│  │  │              Safe.sol Library               │    │    │
+│  │  │                                             │    │    │
 │  │  │  ┌──────────────┐    ┌──────────────────┐   │    │    │
 │  │  │  │  Simulation  │    │    Broadcast     │   │    │    │
 │  │  │  │              │    │                  │   │    │    │
-│  │  │  │ vm.store()   │    │ sign() via FFI   │   │    │    │
-│  │  │  │ vm.prank()   │    │ HTTP POST to API │   │    │    │
-│  │  │  │ execTx()     │    │                  │   │    │    │
+│  │  │  │ vm.store()   │    │ cast wallet sign │   │    │    │
+│  │  │  │ vm.prank()   │    │  (via FFI)       │   │    │    │
+│  │  │  │ execTx()     │    │ HTTP POST to API │   │    │    │
 │  │  │  └──────────────┘    └──────────────────┘   │    │    │
 │  │  └─────────────────────────────────────────────┘    │    │
 │  └─────────────────────────────────────────────────────┘    │
